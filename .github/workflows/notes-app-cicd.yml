@@ -46,6 +46,14 @@ jobs:
         with:
           terraform_version: "1.9.8"
 
+      - name: Debug Terraform formatting
+        run: |
+          echo "Commit: $GITHUB_SHA"
+          terraform version
+          pwd
+          git status --short
+          terraform fmt -check -recursive -diff
+
       - name: Format check
         working-directory: ${{ env.TF_WORKING_DIR }}
         run: terraform fmt -check -recursive
