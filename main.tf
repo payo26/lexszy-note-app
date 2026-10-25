@@ -22,8 +22,7 @@ terraform {
     key                  = "notes-app.terraform.tfstate"
 
     use_azuread_auth = true
-    use_cli          = true
-  }
+    }
 }
 
 
