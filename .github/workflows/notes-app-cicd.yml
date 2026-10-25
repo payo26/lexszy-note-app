@@ -24,14 +24,23 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  # Azure authentication using GitHub OIDC
+  ARM_USE_OIDC: "true"
+  ARM_USE_AZUREAD: "true"
+  ARM_USE_CLI: "false"
+  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+  # Terraform configuration
   TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
-  ACR_NAME: notesappacr1ead709e
-  IMAGE_NAME: notes-app
   TF_WORKING_DIR: "."
 
+  # Docker image configuration
+  ACR_NAME: notesappacr1ead709e
+  IMAGE_NAME: notes-app
 jobs:
   validate:
     name: Terraform Validation
