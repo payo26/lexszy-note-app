@@ -99,7 +99,7 @@ jobs:
 
       - name: Initialize remote state
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -input=false
+        run: terraform init -reconfigure -input=false
 
       - name: Terraform plan
         working-directory: ${{ env.TF_WORKING_DIR }}
@@ -134,7 +134,7 @@ jobs:
 
       - name: Initialize Terraform remote state
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -input=false
+        run: terraform init -reconfigure -input=false
 
       - name: Generate Docker image tag
         id: image
