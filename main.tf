@@ -132,5 +132,5 @@ output "container_instance_ip" {
 }
 
 output "notes_app_url" {
-    value = "http://${azurerm_container_group.notes_app.fqdn}:3000"
-    }
+  value = "http://${azurerm_container_group.notes_app.fqdn}:3000"
+}
