@@ -14,6 +14,7 @@ terraform {
     key                  = "notes-app.terraform.tfstate"
 
     use_azuread_auth = true
+    use_oidc_auth  = true
   }
 }
 
