@@ -54,9 +54,9 @@ jobs:
           git status --short
           terraform fmt -check -recursive -diff
 
-      - name: Format check
+     # - name: Format check
         working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform fmt -check -recursive
+      #  run: terraform fmt -check -recursive
 
       - name: Initialize Terraform without backend
         working-directory: ${{ env.TF_WORKING_DIR }}
