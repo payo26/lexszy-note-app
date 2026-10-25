@@ -69,3 +69,9 @@ variable "deploy_containers" {
   type        = bool
   default     = false
 }
+
+variable "image_tag" {
+  description = "Docker image tag deployed to ACI"
+  type        = string
+  default     = "v1"
+}
