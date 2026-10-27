@@ -25,6 +25,23 @@ terraform {
   }
 }
 
+provider "azurerm" {
+  features {}
+  subscription_id = "790aa1f8-6209-43c8-8546-2cbff23d845f"
+}
+
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "notes-app-rg"
+    storage_account_name = "notesvaultstate2510"
+    container_name       = "tfstate"
+    key                  = "notes-app.terraform.tfstate"
+
+    use_azuread_auth = true
+    use_cli          = true
+  }
+}
+
 
 # Generate unique suffix for ACI DNS name
 resource "random_id" "dns_suffix" {
@@ -123,4 +140,6 @@ output "container_instance_ip" {
   value = azurerm_container_group.notes_app.ip_address
 }
 
-
+output "notes_app_url" {
+  value = "http://${azurerm_container_group.notes_app.fqdn}:3000"
+}
