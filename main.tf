@@ -6,21 +6,23 @@ terraform {
       version = "~> 4.57.0"
     }
   }
-
-  backend "azurerm" {
-    resource_group_name  = "notes-app-rg"
-    storage_account_name = "notesapptfstate261024"
-    container_name       = "tfstate"
-    key                  = "notes-app.terraform.tfstate"
-
-    use_azuread_auth = true
-    use_oidc         = true
-  }
 }
 
 provider "azurerm" {
   features {}
   subscription_id = "790aa1f8-6209-43c8-8546-2cbff23d845f"
+}
+
+terraform {
+  backend "azurerm" {
+    resource_group_name  = "terraformstate-rg"
+    storage_account_name = "notesapptfstate261024"
+    container_name       = "tfstate"
+    key                  = "notes-app.terraform.tfstate"
+
+    use_azuread_auth = true
+    use_cli          = true
+  }
 }
 
 
@@ -47,14 +49,6 @@ resource "azurerm_container_group" "notes_app" {
   location            = azurerm_resource_group.rg.location
   resource_group_name = azurerm_resource_group.rg.name
   os_type             = "Linux"
-  ip_address_type     = "Public"
-  dns_name_label      = "notes-app-${random_id.dns_suffix.hex}"
-
-  exposed_port {
-    port     = 3000
-    protocol = "TCP"
-  }
-
   image_registry_credential {
     server   = azurerm_container_registry.acr.login_server
     username = azurerm_container_registry.acr.admin_username
@@ -64,9 +58,10 @@ resource "azurerm_container_group" "notes_app" {
   # Notes App container
   container {
     name   = "notes-app-container"
-    image  = "${azurerm_container_registry.acr.login_server}/notes-app:${var.image_tag}"
+    image  = "${azurerm_container_registry.acr.login_server}/notes-app:v1"
     cpu    = 0.5
     memory = 1.5
+    commands = ["/bin/sh", "-c", "sleep 20 && node server.js"]
 
     ports {
       port     = 3000
@@ -88,7 +83,7 @@ resource "azurerm_container_group" "notes_app" {
   # PostgreSQL container
   container {
     name   = "postgres"
-    image  = "postgres:16-alpine"
+    image  = "${azurerm_container_registry.acr.login_server}/postgres:16-alpine"
     cpu    = 0.5
     memory = 1.0
 
@@ -128,6 +123,4 @@ output "container_instance_ip" {
   value = azurerm_container_group.notes_app.ip_address
 }
 
-output "notes_app_url" {
-  value = "http://${azurerm_container_group.notes_app.fqdn}:3000"
-}
+
