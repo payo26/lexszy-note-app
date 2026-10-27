@@ -6,40 +6,21 @@ terraform {
       version = "~> 4.57.0"
     }
   }
-}
 
-provider "azurerm" {
-  features {}
-  subscription_id = "790aa1f8-6209-43c8-8546-2cbff23d845f"
-}
-
-terraform {
   backend "azurerm" {
-    resource_group_name  = "terraformstate-rg"
+    resource_group_name  = "notes-app-rg"
     storage_account_name = "notesapptfstate261024"
     container_name       = "tfstate"
     key                  = "notes-app.terraform.tfstate"
 
     use_azuread_auth = true
-    use_cli          = true
+    use_oidc         = true
   }
 }
 
 provider "azurerm" {
   features {}
   subscription_id = "790aa1f8-6209-43c8-8546-2cbff23d845f"
-}
-
-terraform {
-  backend "azurerm" {
-    resource_group_name  = "notes-app-rg"
-    storage_account_name = "notesvaultstate2510"
-    container_name       = "tfstate"
-    key                  = "notes-app.terraform.tfstate"
-
-    use_azuread_auth = true
-    use_cli          = true
-  }
 }
 
 
