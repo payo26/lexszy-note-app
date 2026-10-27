@@ -1,182 +1,401 @@
-
-name: Notes App Azure CI/CD
+name: Build and Deploy
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - "**"
-      - "!.github/README.md"
-
-  pull_request:
-    branches:
-      - main
-
+    branches: [ main ]
   workflow_dispatch:
+    inputs:
+      action:
+        description: "Action to run"
+        type: choice
+        default: deploy
+        options: [ deploy, destroy ]
+      confirm:
+        description: 'Destroy only: type "destroy" to confirm'
+        type: string
+        required: false
+      delete_state:
+        description: "Destroy only: also delete the Terraform state storage"
+        type: boolean
+        default: true
 
 permissions:
-  id-token: write
   contents: read
 
 concurrency:
-  group: notes-app-terraform
+  group: deploy-notes-app
   cancel-in-progress: false
 
 env:
-  # Azure authentication using GitHub OIDC
-  ARM_USE_OIDC: "true"
-  ARM_USE_AZUREAD: "true"
-  ARM_USE_CLI: "false"
-  ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
-  ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
-  ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-
-  # Terraform configuration
-  TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
-  TF_IN_AUTOMATION: "true"
-  TF_INPUT: "false"
-  TF_WORKING_DIR: "."
-
-  # Docker image configuration
-  ACR_NAME: notesappacr1ead709e
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.GROUP_ONE_SUBSCRIPTION_ID }}
+  LOCATION: eastus
+  MAIN_RESOURCE_GROUP: notes-app-rg
+  STATE_RESOURCE_GROUP: notes-app-rg
+  STATE_STORAGE_ACCOUNT: notesvaultstate2510
+  STATE_CONTAINER: tfstate
+  TF_DIR: .
   IMAGE_NAME: notes-app
+  BUILD_CONTEXT: .
+  APP_PORT: 3000
+  REGISTRY_TARGET: -target=azurerm_container_registry.acr
+  CONTAINER_GROUP_ADDRESS: azurerm_container_group.notes_app
+  ADDRESS_OUTPUT: container_group_fqdn
+  ADDRESS_OUTPUT_FALLBACK: container_instance_ip
+
 jobs:
-  validate:
-    name: Terraform Validation
+  build-and-deploy:
+    if: github.event_name == 'push' || inputs.action == 'deploy'
     runs-on: ubuntu-latest
-
+    env:
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+      TF_VAR_image_tag: ${{ github.sha }}
+      TF_VAR_deploy_containers: "true"
     steps:
-      - name: Checkout repository
+      - name: Start timer
+        run: echo "START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: 1. Check out the code
         uses: actions/checkout@v4
 
-      - name: Install Terraform
+      - name: Detect image tagging mode
+        run: |
+          if grep -q 'var.image_tag' "$TF_DIR"/*.tf; then
+            echo "IMAGE_MODE=tag" >> "$GITHUB_ENV"
+            echo "MOVING_TAG=latest" >> "$GITHUB_ENV"
+            echo "Terraform takes the image tag as a variable"
+          else
+            FIXED_TAG=$(grep -ho "$IMAGE_NAME:[A-Za-z0-9._-]*" "$TF_DIR"/*.tf | head -1 | cut -d: -f2)
+            if [ -z "$FIXED_TAG" ]; then
+              echo "::error::Image $IMAGE_NAME:<tag> not found in the Terraform code."
+              exit 1
+            fi
+            echo "IMAGE_MODE=replace" >> "$GITHUB_ENV"
+            echo "MOVING_TAG=$FIXED_TAG" >> "$GITHUB_ENV"
+            echo "Fixed image tag ($FIXED_TAG): the container group is re-created on each deploy"
+          fi
+
+      - name: 2. Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+
+      - name: Report existing resources
+        run: |
+          status() { if "$@" > /dev/null 2>&1; then echo "EXISTS"; else echo "MISSING"; fi; }
+
+          REG=$(az acr list --resource-group "$MAIN_RESOURCE_GROUP" --query "[0].name" --output tsv 2>/dev/null || true)
+          [ -n "$REG" ] && REG_STATUS="EXISTS ($REG)" || REG_STATUS="MISSING"
+
+          echo "Resource group      : $(status az group show --name "$MAIN_RESOURCE_GROUP")"
+          echo "State storage       : $(status az storage account show --name "$STATE_STORAGE_ACCOUNT" --resource-group "$STATE_RESOURCE_GROUP")"
+          echo "Container registry  : $REG_STATUS"
+
+      - name: Configure Terraform credentials
+        env:
+          AZURE_CREDENTIALS_JSON: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+        run: |
+          CLIENT_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientId)
+          CLIENT_SECRET=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientSecret)
+          SUBSCRIPTION_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .subscriptionId)
+          TENANT_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .tenantId)
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "::add-mask::$CLIENT_ID"
+          echo "::add-mask::$TENANT_ID"
+
+          if [ "$SUBSCRIPTION_ID" != "$AZURE_SUBSCRIPTION_ID" ]; then
+            echo "::error::Azure credentials belong to a different subscription than AZURE_SUBSCRIPTION_ID."
+            exit 1
+          fi
+
+          TF_SUBSCRIPTION=$(grep -hoP 'subscription_id\s*=\s*"\K[^"]+' "$TF_DIR"/*.tf | head -1 || true)
+          if [ -n "$TF_SUBSCRIPTION" ] && [ "$TF_SUBSCRIPTION" != "$AZURE_SUBSCRIPTION_ID" ]; then
+            echo "::error::main.tf uses a different subscription_id than AZURE_SUBSCRIPTION_ID."
+            exit 1
+          fi
+
+          az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+          {
+            echo "ARM_CLIENT_ID=$CLIENT_ID"
+            echo "ARM_CLIENT_SECRET=$CLIENT_SECRET"
+            echo "ARM_SUBSCRIPTION_ID=$AZURE_SUBSCRIPTION_ID"
+            echo "ARM_TENANT_ID=$TENANT_ID"
+            echo "TF_VAR_subscription_id=$AZURE_SUBSCRIPTION_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9.8"
+          terraform_version: "<2.0.0"
+          terraform_wrapper: false
 
-      - name: Debug Terraform formatting
+      - name: Register Azure resource providers
         run: |
-          echo "Commit: $GITHUB_SHA"
-          terraform version
-          pwd
-          git status --short
-          terraform fmt -check -recursive -diff
+          for NS in Microsoft.Storage Microsoft.ContainerRegistry Microsoft.ContainerInstance; do
+            STATE=$(az provider show --namespace "$NS" --query registrationState --output tsv)
+            if [ "$STATE" != "Registered" ]; then
+              az provider register --namespace "$NS" --wait
+            fi
+          done
 
-      - name: Format check
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform fmt -check -recursive
+      - name: Ensure Terraform state storage
+        run: |
+          if [ "$(az group exists --name "$STATE_RESOURCE_GROUP")" = "false" ]; then
+            az group create --name "$STATE_RESOURCE_GROUP" --location "$LOCATION" --output none
+            echo "CREATED_STATE=yes" >> "$GITHUB_ENV"
+          fi
+
+          if ! az storage account show --name "$STATE_STORAGE_ACCOUNT" --resource-group "$STATE_RESOURCE_GROUP" > /dev/null 2>&1; then
+            az storage account create \
+              --name "$STATE_STORAGE_ACCOUNT" \
+              --resource-group "$STATE_RESOURCE_GROUP" \
+              --location "$LOCATION" \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false \
+              --output none
+            echo "CREATED_STATE=yes" >> "$GITHUB_ENV"
+          fi
+
+          KEY=$(az storage account keys list --account-name "$STATE_STORAGE_ACCOUNT" --resource-group "$STATE_RESOURCE_GROUP" --query "[0].value" --output tsv)
+          echo "::add-mask::$KEY"
+          az storage container create --name "$STATE_CONTAINER" --account-name "$STATE_STORAGE_ACCOUNT" --account-key "$KEY" --output none
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          for i in 1 2 3 4 5; do
+            terraform init -input=false && exit 0
+            echo "Init failed (attempt $i of 5), retrying in 30 seconds"
+            sleep 30
+          done
+          echo "::error::terraform init failed. Check the service principal has Storage Blob Data Contributor and that the backend settings match the STATE_* values."
+          exit 1
+
+      - name: Import resource group if untracked
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          KNOWN=$(terraform state list 2>/dev/null || true)
+          if grep -q 'resource "azurerm_resource_group" "rg"' ./*.tf \
+             && [ "$(az group exists --name "$MAIN_RESOURCE_GROUP")" = "true" ] \
+             && ! echo "$KNOWN" | grep -qx 'azurerm_resource_group.rg'; then
+            terraform import -input=false azurerm_resource_group.rg "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$MAIN_RESOURCE_GROUP"
+          fi
+
+      - name: Ensure container registry
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          REG_BEFORE=$(az acr list --resource-group "$MAIN_RESOURCE_GROUP" --query "[0].name" --output tsv 2>/dev/null || true)
+          [ -z "$REG_BEFORE" ] && echo "CREATED_REGISTRY=yes" >> "$GITHUB_ENV"
+
+          terraform apply -input=false -auto-approve $REGISTRY_TARGET
+
+          ACR_NAME=$(az acr list --resource-group "$MAIN_RESOURCE_GROUP" --query "[0].name" --output tsv)
+          if [ -z "$ACR_NAME" ]; then
+            echo "::error::No registry found in $MAIN_RESOURCE_GROUP."
+            exit 1
+          fi
+          echo "ACR_NAME=$ACR_NAME" >> "$GITHUB_ENV"
+
+      - name: Copy the PostgreSQL image into the registry
+        run: |
+          SOURCE=docker.io/library/postgres:16-alpine
+          if az acr repository show --name "$ACR_NAME" --image postgres:16-alpine > /dev/null 2>&1; then
+            echo "postgres:16-alpine is already in $ACR_NAME"
+            exit 0
+          fi
+          for i in 1 2 3 4 5; do
+            if az acr import --name "$ACR_NAME" --source "$SOURCE" --image postgres:16-alpine --force; then
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 30 seconds"
+            sleep 30
+          done
+          echo "::error::Could not copy $SOURCE into $ACR_NAME."
+          exit 1
+
+      - name: 3. Build and push the image to ACR
+        run: |
+          az acr login --name "$ACR_NAME"
+          IMAGE="$ACR_NAME.azurecr.io/$IMAGE_NAME"
+          docker build -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:$MOVING_TAG" "$BUILD_CONTEXT"
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker push "$IMAGE:$MOVING_TAG"
+
+      - name: 4. Update the container group with Terraform
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          REPLACE=""
+          if [ "$IMAGE_MODE" = "replace" ] && terraform state list 2>/dev/null | grep -qx "$CONTAINER_GROUP_ADDRESS"; then
+            REPLACE="-replace=$CONTAINER_GROUP_ADDRESS"
+          fi
+          terraform apply -input=false -auto-approve $REPLACE
+
+      - name: Wait for the app and stop timer
+        working-directory: ${{ env.TF_DIR }}
+        env:
+          COMMIT_TIME: ${{ github.event.head_commit.timestamp }}
+        run: |
+          ADDRESS=$(terraform output -raw "$ADDRESS_OUTPUT" 2>/dev/null || terraform output -raw "$ADDRESS_OUTPUT_FALLBACK")
+          case "$ADDRESS" in
+            http*) LIVE_URL="$ADDRESS" ;;
+            *) if [ "$APP_PORT" = "80" ]; then LIVE_URL="http://$ADDRESS"; else LIVE_URL="http://$ADDRESS:$APP_PORT"; fi ;;
+          esac
+          echo "LIVE_URL=$LIVE_URL" >> "$GITHUB_ENV"
+
+          LIVE=no
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 5 -o /dev/null "$LIVE_URL/api/notes"; then
+              LIVE=yes
+              break
+            fi
+            echo "Not ready (attempt $i of 60), retrying in 10 seconds"
+            sleep 10
+          done
+          if [ "$LIVE" != "yes" ]; then
+            echo "::error::No response from $LIVE_URL/api/notes after 10 minutes. Check the container logs; a common cause is the app starting before PostgreSQL is ready."
+            exit 1
+          fi
+
+          NOW=$(date +%s)
+          PIPELINE_SECS=$((NOW - START_EPOCH))
+          if [ -n "$COMMIT_TIME" ]; then
+            MERGE_SECS=$((NOW - $(date -d "$COMMIT_TIME" +%s)))
+          else
+            MERGE_SECS=$PIPELINE_SECS
+          fi
+          echo "PIPELINE_TXT=$((PIPELINE_SECS / 60))m $((PIPELINE_SECS % 60))s" >> "$GITHUB_ENV"
+          echo "MERGE_TXT=$((MERGE_SECS / 60))m $((MERGE_SECS % 60))s" >> "$GITHUB_ENV"
+
+      - name: 5. Print the live address
+        run: |
+          if [ "${CREATED_STATE:-no}" = "yes" ] || [ "${CREATED_REGISTRY:-no}" = "yes" ]; then
+            RUN_TYPE="Built from scratch"
+          else
+            RUN_TYPE="Update of an existing deployment"
+          fi
+
+          {
+            echo "### The notes app is live"
+            echo ""
+            echo "[$LIVE_URL]($LIVE_URL)"
+            echo ""
+            echo "| Measure | Value |"
+            echo "|---|---|"
+            echo "| Run type | $RUN_TYPE |"
+            echo "| Merge to live | $MERGE_TXT |"
+            echo "| Pipeline only | $PIPELINE_TXT |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Run type      : $RUN_TYPE"
+          echo "Merge to live : $MERGE_TXT"
+          echo "Pipeline only : $PIPELINE_TXT"
+          echo ""
+          echo "LIVE ADDRESS: $LIVE_URL"
+
+  confirm-destroy:
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "destroy" ]; then
+            echo "::error::Type the word destroy to confirm. Nothing was deleted."
+            exit 1
+          fi
+          echo "Destroying $MAIN_RESOURCE_GROUP (state group: $STATE_RESOURCE_GROUP, delete state: ${{ inputs.delete_state }})"
+
+  destroy:
+    needs: confirm-destroy
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_db_password: ${{ secrets.DB_PASSWORD }}
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+
+      - name: Configure Terraform credentials
+        env:
+          AZURE_CREDENTIALS_JSON: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+        run: |
+          CLIENT_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientId)
+          CLIENT_SECRET=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientSecret)
+          SUBSCRIPTION_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .subscriptionId)
+          TENANT_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .tenantId)
+          echo "::add-mask::$CLIENT_SECRET"
+          echo "::add-mask::$CLIENT_ID"
+          echo "::add-mask::$TENANT_ID"
+
+          if [ "$SUBSCRIPTION_ID" != "$AZURE_SUBSCRIPTION_ID" ]; then
+            echo "::error::Azure credentials belong to a different subscription than AZURE_SUBSCRIPTION_ID. Nothing was deleted."
+            exit 1
+          fi
+
+          az account set --subscription "$AZURE_SUBSCRIPTION_ID"
+
+          {
+            echo "ARM_CLIENT_ID=$CLIENT_ID"
+            echo "ARM_CLIENT_SECRET=$CLIENT_SECRET"
+            echo "ARM_SUBSCRIPTION_ID=$AZURE_SUBSCRIPTION_ID"
+            echo "ARM_TENANT_ID=$TENANT_ID"
+            echo "TF_VAR_subscription_id=$AZURE_SUBSCRIPTION_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "<2.0.0"
+          terraform_wrapper: false
+
+      - name: Terraform destroy
+        id: tf
         continue-on-error: true
-
-      - name: Initialize Terraform without backend
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -backend=false
-
-      - name: Validate Terraform
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform validate
-
-  plan:
-    name: Terraform Plan
-    needs: validate
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Azure login using OIDC
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Install Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.9.8"
-
-      - name: Initialize remote state
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -reconfigure -input=false
-
-      - name: Terraform plan
-        working-directory: ${{ env.TF_WORKING_DIR }}
+        working-directory: ${{ env.TF_DIR }}
         run: |
-          terraform plan \
-            -input=false \
-            -var="image_tag=v1" \
-            -no-color
+          terraform init -input=false
+          terraform destroy -input=false -auto-approve
 
-  deploy:
-    name: Build Push and Deploy
-    needs: plan
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    environment: production
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Azure login using OIDC
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-      - name: Install Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.9.8"
-
-      - name: Initialize Terraform remote state
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform init -reconfigure -input=false
-
-      - name: Generate Docker image tag
-        id: image
-        shell: bash
+      - name: Delete the main resource group
+        if: always()
         run: |
-          TAG="${GITHUB_SHA::12}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$(az group exists --name "$MAIN_RESOURCE_GROUP")" = "true" ]; then
+            az group delete --name "$MAIN_RESOURCE_GROUP" --yes
+          fi
 
-      - name: Login to Azure Container Registry
-        run: az acr login --name "$ACR_NAME"
-
-      - name: Build Docker image
+      - name: Delete the state resource group
+        if: ${{ always() && inputs.delete_state }}
         run: |
-          docker build \
-            -t "$ACR_NAME.azurecr.io/$IMAGE_NAME:${{ steps.image.outputs.tag }}" \
-            .
+          if [ "$(az group exists --name "$STATE_RESOURCE_GROUP")" = "true" ]; then
+            az group delete --name "$STATE_RESOURCE_GROUP" --yes
+          fi
 
-      - name: Push image to ACR
+      - name: Verify cleanup
+        if: always()
+        env:
+          TF_OUTCOME: ${{ steps.tf.outcome }}
+          DELETE_STATE: ${{ inputs.delete_state }}
         run: |
-          docker push \
-            "$ACR_NAME.azurecr.io/$IMAGE_NAME:${{ steps.image.outputs.tag }}"
+          FAILED=no
+          [ "$TF_OUTCOME" != "success" ] && echo "::notice::terraform destroy reported an error (expected while the state storage is in the same resource group); the resource group was deleted directly."
 
-      - name: Terraform plan for deployment
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: |
-          terraform plan \
-            -input=false \
-            -var="image_tag=${{ steps.image.outputs.tag }}" \
-            -out=tfplan
+          if [ "$(az group exists --name "$MAIN_RESOURCE_GROUP")" = "true" ]; then
+            echo "::error::$MAIN_RESOURCE_GROUP still exists"
+            FAILED=yes
+          fi
+          if [ "$DELETE_STATE" = "true" ] && [ "$(az group exists --name "$STATE_RESOURCE_GROUP")" = "true" ]; then
+            echo "::error::$STATE_RESOURCE_GROUP still exists"
+            FAILED=yes
+          fi
 
-      - name: Deploy Azure infrastructure
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform apply -input=false -auto-approve tfplan
+          echo "Resources still in the subscription:"
+          az resource list --query "[].{name:name, type:type, group:resourceGroup}" --output table || true
 
-      - name: Verify container group
-        run: |
-          az container show \
-            --resource-group notes-app-rg \
-            --name notes-app-container-group \
-            --query "containers[].{Name:name,State:instanceView.currentState.state}" \
-            -o table
-
-      - name: Show deployment outputs
-        working-directory: ${{ env.TF_WORKING_DIR }}
-        run: terraform output
+          [ "$FAILED" = "no" ]
