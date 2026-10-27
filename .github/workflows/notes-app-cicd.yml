@@ -27,7 +27,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AZURE_SUBSCRIPTION_ID: ${{ secrets.GROUP_ONE_SUBSCRIPTION_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
   LOCATION: eastus
   MAIN_RESOURCE_GROUP: notes-app-rg
   STATE_RESOURCE_GROUP: notes-app-rg
@@ -77,7 +77,7 @@ jobs:
       - name: 2. Log in to Azure
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Report existing resources
         run: |
@@ -92,7 +92,7 @@ jobs:
 
       - name: Configure Terraform credentials
         env:
-          AZURE_CREDENTIALS_JSON: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+          AZURE_CREDENTIALS_JSON: ${{ secrets.AZURE_CREDENTIALS }}
         run: |
           CLIENT_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientId)
           CLIENT_SECRET=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientSecret)
@@ -320,11 +320,11 @@ jobs:
       - name: Log in to Azure
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Configure Terraform credentials
         env:
-          AZURE_CREDENTIALS_JSON: ${{ secrets.GROUP_ONE_AZURE_CREDENTIALS }}
+          AZURE_CREDENTIALS_JSON: ${{ secrets.AZURE_CREDENTIALS }}
         run: |
           CLIENT_ID=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientId)
           CLIENT_SECRET=$(echo "$AZURE_CREDENTIALS_JSON" | jq -r .clientSecret)
